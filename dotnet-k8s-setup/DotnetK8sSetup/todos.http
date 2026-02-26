@@ -1,0 +1,85 @@
+### Todo API — switch environment in the Rider HTTP client toolbar
+### Environments are defined in http-client.env.json:
+###   local → http://localhost:5239     (dotnet run)
+###   k8s   → http://todo-app.local    (nginx Ingress, Docker Desktop)
+###
+### Run requests top-to-bottom for a full end-to-end flow.
+### The @name directives capture responses; later requests use {{varName.body.id}}.
+
+### ─────────────────────────────────────────────────────────────────────────────
+### 1. GET all todos
+### ─────────────────────────────────────────────────────────────────────────────
+GET {{baseUrl}}/todos
+Accept: application/json
+
+###
+
+### ─────────────────────────────────────────────────────────────────────────────
+### 2. CREATE todo 1  →  id captured as todo1Id
+### ─────────────────────────────────────────────────────────────────────────────
+# @name createTodo1
+POST {{baseUrl}}/todos
+Content-Type: application/json
+
+{
+  "title": "Buy groceries"
+}
+
+> {%
+  client.global.set("todo1Id", response.body.id);
+%}
+
+###
+
+### ─────────────────────────────────────────────────────────────────────────────
+### 3. CREATE todo 2  →  id captured as todo2Id
+### ─────────────────────────────────────────────────────────────────────────────
+# @name createTodo2
+POST {{baseUrl}}/todos
+Content-Type: application/json
+
+{
+  "title": "Write unit tests"
+}
+
+> {%
+  client.global.set("todo2Id", response.body.id);
+%}
+
+###
+
+### ─────────────────────────────────────────────────────────────────────────────
+### 4. GET todo 1 by id
+### ─────────────────────────────────────────────────────────────────────────────
+GET {{baseUrl}}/todos/{{todo1Id}}
+Accept: application/json
+
+###
+
+### ─────────────────────────────────────────────────────────────────────────────
+### 5. UPDATE todo 1 — mark as complete
+### ─────────────────────────────────────────────────────────────────────────────
+PUT {{baseUrl}}/todos/{{todo1Id}}
+Content-Type: application/json
+
+{
+  "title": "Buy groceries",
+  "isComplete": true
+}
+
+###
+
+### ─────────────────────────────────────────────────────────────────────────────
+### 6. DELETE todo 2
+### ─────────────────────────────────────────────────────────────────────────────
+DELETE {{baseUrl}}/todos/{{todo2Id}}
+
+###
+
+### ─────────────────────────────────────────────────────────────────────────────
+### 7. GET all todos — final state (todo1 complete, todo2 gone)
+### ─────────────────────────────────────────────────────────────────────────────
+GET {{baseUrl}}/todos
+Accept: application/json
+
+###

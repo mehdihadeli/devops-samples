@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: todo-app
+  namespace: dotnet-k8s
+  labels:
+    app: todo-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: todo-app
+  template:
+    metadata:
+      labels:
+        app: todo-app
+    spec:
+      containers:
+        - name: todo-app
+          # Replace with your actual image, e.g.: ghcr.io/your-org/dotnet-k8s-setup:latest
+          image: dotnet-k8s-setup:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+
+          env:
+            # Tell ASP.NET Core which port to listen on (non-root safe)
+            - name: ASPNETCORE_HTTP_PORTS
+              value: "8080"
+            # Use the Production environment (loads appsettings.json, skips appsettings.Development.json)
+            - name: ASPNETCORE_ENVIRONMENT
+              value: "Production"
+            # Inject the connection string from the Secret as an env var.
+            # .NET Configuration maps ConnectionStrings__DefaultConnection
+            # → ConnectionStrings:DefaultConnection automatically,
+            # overriding any file-based value. No code changes required.
+            - name: ConnectionStrings__DefaultConnection
+              valueFrom:
+                secretKeyRef:
+                  name: todo-app-secret
+                  key: ConnectionStrings__DefaultConnection
+
+          volumeMounts:
+            # Mount the ConfigMap as /app/appsettings.json.
+            # Using subPath ensures only this file is overlaid;
+            # the rest of /app remains intact.
+            # .NET loads appsettings.json from the working directory (/app) by default,
+            # so this is picked up without any code changes.
+            - name: config-volume
+              mountPath: /app/appsettings.json
+              subPath: appsettings.json
+              readOnly: true
+
+          livenessProbe:
+            httpGet:
+              path: /todos
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /todos
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+
+      volumes:
+        - name: config-volume
+          configMap:
+            name: todo-app-config
+

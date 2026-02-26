@@ -1,0 +1,21 @@
+# ConfigMap holds all non-sensitive application configuration.
+# It is volume-mounted at /app/appsettings.json inside the container,
+# so .NET's default configuration pipeline picks it up automatically —
+# no code changes required.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: todo-app-config
+  namespace: dotnet-k8s
+data:
+  appsettings.json: |
+    {
+      "Logging": {
+        "LogLevel": {
+          "Default": "Information",
+          "Microsoft.AspNetCore": "Warning"
+        }
+      },
+      "AllowedHosts": "*"
+    }
+

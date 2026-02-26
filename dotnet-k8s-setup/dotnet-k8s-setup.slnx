@@ -1,0 +1,17 @@
+<Solution>
+  <Folder Name="/solution folder/">
+    <File Path=".dockerignore" />
+    <File Path="Dockerfile" />
+    <File Path="README.md" />
+  </Folder>
+  <Folder Name="/solution folder/k8s/">
+    <File Path="k8s/configmap.yaml" />
+    <File Path="k8s/deployment.yaml" />
+    <File Path="k8s/ingress.yaml" />
+    <File Path="k8s/namespace.yaml" />
+    <File Path="k8s/postgres.yaml" />
+    <File Path="k8s/secret.yaml" />
+    <File Path="k8s/service.yaml" />
+  </Folder>
+  <Project Path="DotnetK8sSetup/DotnetK8sSetup.csproj" />
+</Solution>
