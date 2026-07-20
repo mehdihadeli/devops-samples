@@ -1,6 +1,7 @@
 # dotnet-k8s-setup
 
 A simple **Todo** application built with:
+
 - **.NET 10 Minimal API**
 - **Entity Framework Core + PostgreSQL (Npgsql)**
 - **Vertical Slice Architecture** (`Features/Todos/`)
@@ -14,13 +15,14 @@ A simple **Todo** application built with:
 2. [How Configuration Works](#how-configuration-works)
 3. [Local Development](#local-development)
 4. [Kubernetes Setup — Step by Step](#kubernetes-setup--step-by-step)
-   - [Step 1 — Install nginx Ingress Controller](#step-1--install-nginx-ingress-controller)
-   - [Step 2 — Build the Docker Image](#step-2--build-the-docker-image)
-   - [Step 3 — Deploy All Manifests](#step-3--deploy-all-manifests)
-   - [Step 4 — Add hosts entry](#step-4--add-hosts-entry)
+   - [Step 1 — Create a k3d cluster](#step-1--create-a-k3d-cluster)
+   - [Step 2 — Install nginx Ingress Controller](#step-2--install-nginx-ingress-controller)
+   - [Step 3 — Build & import the Docker image](#step-3--build--import-the-docker-image)
+   - [Step 4 — Deploy All Manifests](#step-4--deploy-all-manifests)
+   - [Step 5 — Add hosts entry](#step-5--add-hosts-entry)
 5. [How Ingress Works — Inside vs Outside the Cluster](#how-ingress-works--inside-vs-outside-the-cluster)
 6. [Production Ingress Best Practices](#production-ingress-best-practices)
-   - [Option 0 — Docker Desktop / minikube (this repo)](#option-0--docker-desktop--minikube-this-repo--local-dev-only)
+   - [Option 0 — k3d (this repo)](#option-0--k3d-this-repo--local-dev-only)
    - [Option 1 — Cloud Provider LoadBalancer](#option-1--cloud-provider-loadbalancer-managed-clusters)
    - [Option 2 — NodePort](#option-2--nodeport-simplest-bare-metal--any-cluster)
    - [Option 3 — MetalLB (recommended for bare-metal)](#option-3--metallb-recommended-for-bare-metal)
@@ -73,11 +75,11 @@ dotnet-k8s-setup/
 
 .NET's default host builder loads configuration in this priority order (later wins):
 
-| Priority | Source | Provided by |
-|---|---|---|
-| 1 | `appsettings.json` | **ConfigMap** volume-mounted at `/app/appsettings.json` |
-| 2 | `appsettings.{Environment}.json` | Not present in Production — skipped |
-| 3 | Environment variables | **Secret** key injected as env var — wins over the file |
+| Priority | Source                           | Provided by                                             |
+| -------- | -------------------------------- | ------------------------------------------------------- |
+| 1        | `appsettings.json`               | **ConfigMap** volume-mounted at `/app/appsettings.json` |
+| 2        | `appsettings.{Environment}.json` | Not present in Production — skipped                     |
+| 3        | Environment variables            | **Secret** key injected as env var — wins over the file |
 
 ### ConfigMap → `appsettings.json`
 
@@ -88,7 +90,7 @@ The Deployment mounts it directly over `/app/appsettings.json` using `subPath`:
 volumeMounts:
   - name: config-volume
     mountPath: /app/appsettings.json
-    subPath: appsettings.json   # overlays only this file, /app stays intact
+    subPath: appsettings.json # overlays only this file, /app stays intact
     readOnly: true
 ```
 
@@ -138,73 +140,237 @@ dotnet run
 
 ## Kubernetes Setup — Step by Step
 
-### Step 1 — Install nginx Ingress Controller
+### ⚠️ Windows WSL2 prerequisite: cgroup v2
 
-The nginx Ingress Controller is a pod that runs **inside** the cluster and handles all inbound
-HTTP traffic. On Docker Desktop it is exposed to your host via a `LoadBalancer` service that
-Docker Desktop maps to `localhost`.
+> **This is the #1 gotcha when running k3d on Windows with WSL2.**
+
+Newer k3s images (≥ v1.27+) have **dropped support for cgroup v1**. Docker Desktop on Windows
+still defaults to cgroup v1 by default — the result is that the kubelet inside the k3s container
+crashes immediately with:
+
+```
+kubelet exited: failed to validate kubelet configuration, error:
+kubelet is configured to not run on a host using cgroup v1
+```
+
+#### Fix: enable cgroup v2 in WSL2
+
+Add this line to `%USERPROFILE%\.wslconfig` (`C:\Users\YourName\.wslconfig`):
+
+```ini
+[wsl2]
+kernelCommandLine = cgroup_no_v1=all  # Enable cgroup v2
+```
+
+Then restart WSL and Docker Desktop:
 
 ```bash
-kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.12.0/deploy/static/provider/cloud/deploy.yaml
+wsl --shutdown
+# Then manually restart Docker Desktop (right-click tray icon → Restart)
+```
 
-# Wait for the controller pod to be ready
+Verify cgroup v2 is active:
+
+```bash
+docker info --format '{{.CgroupVersion}}'
+# Should output: 2
+```
+
+If you skip this step, `kubectl get nodes` or `kubectl get pods` will hang with
+`dial tcp ... connectex: No connection could be made` because the k3s server never
+finished booting.
+
+---
+
+You can set up the cluster **with the automated script** (recommended) or **manually step by step**.
+
+---
+
+### 🚀 Option A — Automated setup (recommended)
+
+The repository includes a single script that handles everything — prerequisites, cgroup v2 check,
+cluster creation, ingress install, image build, manifests, and hosts entry:
+
+```bash
+# From the repo root — full setup (Docker build included)
+./scripts/setup-k3d.sh
+
+# Skip the Docker build if you already built the image
+./scripts/setup-k3d.sh --skip-build
+```
+
+The script is idempotent — safe to re-run if anything fails partway through.
+
+---
+
+### 🔧 Option B — Manual setup step by step
+
+#### Step 1 — Create a k3d cluster
+
+[k3d](https://k3d.io) runs a lightweight Kubernetes cluster (k3s) inside Docker containers.
+It ships a built-in load balancer container (`k3d-dev-serverlb`) that sits in front of your
+server nodes — this is what forwards `http://localhost:80` into the cluster.
+
+```bash
+# Create a cluster with port 80/443 forwarded to the load balancer
+k3d cluster create dev \
+  --servers 1 \
+  --agents 0 \
+  -p "80:80@loadbalancer" \
+  -p "443:443@loadbalancer"
+
+# Merge kubeconfig into your default config and switch context
+k3d kubeconfig merge dev --kubeconfig-merge-default --kubeconfig-switch-context
+
+# Verify nodes are Ready
+kubectl get nodes
+# NAME               STATUS   ROLES           AGE   VERSION
+# k3d-dev-server-0   Ready    control-plane   20s   v1.35.5+k3s1
+```
+
+> **Note:** The `-p "80:80@loadbalancer"` flag tells k3d to map your host's port 80 to port 80
+> on the built-in load balancer container. Without this, the cluster is isolated from your host
+> network.
+
+##### How k3d's Built-in Load Balancer Works
+
+Every k3d cluster (by default) creates an **nginx-based load balancer container** called
+`k3d-{name}-serverlb` (e.g. `k3d-dev-serverlb`). It's the entry point for all external
+traffic into your cluster.
+
+**What it does:**
+
+| Function             | Description                                                                                                                                  |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| **API Server proxy** | Proxies `https://localhost:{port}` → k3s API server (port 6443). Without this, `kubectl` couldn't reach the control plane.                   |
+| **Port mapping**     | Forwards host ports to server node ports via `-p "hostPort:nodePort@loadbalancer"`. This is how HTTP traffic reaches the ingress controller. |
+| **Load balancing**   | Distributes requests across all server nodes (relevant in multi-server clusters).                                                            |
+
+**Architecture:**
+
+```
+Host machine :80 / :443     Host machine :{apiPort} (e.g. 10225)
+       │                           │
+       ▼                           ▼
+┌───────────────────────────────────────────────────────┐
+│  k3d-dev-serverlb  (nginx + confd — k3d-proxy image)  │
+│  ┌─────────────────┐   ┌────────────────────────────┐ │
+│  │ upstream servers │   │ upstream api-server        │ │
+│  │ port 80 → node:80│   │ port 6443 → server-0:6443  │ │
+│  │ port 443→node:443│   │                            │ │
+│  └─────────────────┘   └────────────────────────────┘ │
+└───────────────────────────────────────────────────────┘
+       │                           │
+       ▼                           ▼
+k3d-dev-server-0:80         k3d-dev-server-0:6443
+(ingress-nginx hostNetwork)  (k3s API server)
+```
+
+**Key details:**
+
+- **Image**: Uses `k3d-io/k3d-proxy` — a custom nginx image bundled with [confd](https://github.com/k3d-io/k3d/blob/main/docs/design/project.md) for dynamic config reload.
+- **Default**: Created automatically. Disable with `--disable-loadbalancer` flag (not recommended — you'd lose API server access and port mapping).
+- **Nodefilter**: The `@loadbalancer` suffix in port mappings (e.g. `-p "80:80@loadbalancer"`) targets this specific container. Other filters: `@server:0`, `@agent:*`, `@all`.
+- **Config overrides**: Tweak nginx settings via `--lb-config-override`:
+  ```bash
+  k3d cluster create dev --lb-config-override "settings.workerConnections=2048"
+  ```
+- **Official docs**: [k3d Proxy/Loadbalancer Design](https://github.com/k3d-io/k3d/blob/main/docs/design/project.md), [Exposing Services via Ingress](https://github.com/k3d-io/k3d/blob/main/docs/usage/exposing_services.md), [Port Mapping Reference](https://github.com/k3d-io/k3d/blob/main/docs/usage/commands/k3d_cluster_create.md).
+
+#### Step 2 — Install nginx Ingress Controller
+
+The nginx Ingress Controller runs as a pod **inside** the cluster and handles all inbound
+HTTP traffic. We install it with `hostNetwork: true` so it binds directly to port 80/443
+on the server node. The k3d load balancer then forwards: host:80 → loadbalancer:80 → server
+node:80 → controller pod:80.
+
+```bash
+helm upgrade --install ingress-nginx ingress-nginx \
+  --repo https://kubernetes.github.io/ingress-nginx \
+  --namespace ingress-nginx --create-namespace \
+  --set controller.hostNetwork=true \
+  --set controller.service.type=ClusterIP \
+  --wait \
+  --timeout 3m
+
+# Verify the controller is running
 kubectl wait --namespace ingress-nginx \
   --for=condition=ready pod \
   --selector=app.kubernetes.io/component=controller \
   --timeout=120s
 
-# Verify: should show Type=LoadBalancer, EXTERNAL-IP=localhost (Docker Desktop)
-kubectl get svc ingress-nginx-controller -n ingress-nginx
+# Check it
+kubectl get pods -n ingress-nginx
+# NAME                                        READY   STATUS    RESTARTS   AGE
+# ingress-nginx-controller-xxxxxxxxx-yyyyy    1/1     Running   0          60s
 ```
 
-### Step 2 — Build the Docker Image
+#### Step 3 — Build & import the Docker image
+
+Since k3d runs Kubernetes **inside Docker containers** (not a separate VM), the cluster's
+container runtime is Docker itself. But the image must still be **imported** into k3d's
+internal registry so every node can pull it — building locally won't make it visible
+to the cluster automatically.
 
 ```bash
 # From the repo root (where Dockerfile lives)
 docker build -t dotnet-k8s-setup:latest .
 
-# For a real registry (e.g., GHCR, Docker Hub, ACR) — replace <registry>
-docker build -t <registry>/dotnet-k8s-setup:latest .
-docker push <registry>/dotnet-k8s-setup:latest
-# Then update image: in k8s/deployment.yaml to match
+# Import directly into the k3d cluster (no external registry needed)
+k3d image import dotnet-k8s-setup:latest -c dev
+
+# Verify the image is available in the cluster
+docker exec k3d-dev-server-0 ctr image ls | grep dotnet-k8s-setup
 ```
 
-### Step 3 — Deploy All Manifests
+#### Step 4 — Deploy All Manifests
 
-Apply in this order (namespace and secrets must exist before pods start):
+Apply everything in one shot — Kubernetes resolves dependencies automatically:
 
 ```bash
-kubectl apply -f k8s/namespace.yaml    # 1. create the dotnet-k8s namespace first
-kubectl apply -f k8s/secret.yaml       # 2. secrets before pods reference them
-kubectl apply -f k8s/configmap.yaml    # 3. configmap before pods reference it
-kubectl apply -f k8s/postgres.yaml     # 4. database (PVC + Deployment + Service)
-kubectl apply -f k8s/deployment.yaml   # 5. app (3 replicas)
-kubectl apply -f k8s/service.yaml      # 6. ClusterIP service
-kubectl apply -f k8s/ingress.yaml      # 7. Ingress rule
-
-# Or apply the whole folder at once (order is handled by K8s dependency resolution):
 kubectl apply -f k8s/
 
-# Watch the rollout
+# Watch the rollout (Ctrl+C when it's ready)
 kubectl rollout status deployment/todo-app -n dotnet-k8s --timeout=120s
+
+# Verify all pods are running
+kubectl get pods -n dotnet-k8s
+# NAME                        READY   STATUS    RESTARTS   AGE
+# todo-app-xxxxx-yyyy         1/1     Running   0          30s
+# todo-app-xxxxx-zzzz         1/1     Running   0          30s
+# todo-app-xxxxx-wwww         1/1     Running   0          30s
+# postgres-xxxxx-yyyy         1/1     Running   0          30s
 ```
 
-### Step 4 — Add hosts entry
+If pods stay in `ImagePullBackOff` or `ErrImagePull`, the image wasn't imported properly —
+re-run `k3d image import` from Step 3.
 
-The Ingress rule routes traffic for `todo-app.local`. Add it to your hosts file so your OS
-resolves the name to `localhost` (where Docker Desktop exposes the LoadBalancer):
+#### Step 5 — Add hosts entry
 
-**Windows (run as Administrator):**
+The Ingress rule routes traffic for `todo-app.local`. You need to tell your OS to resolve
+that hostname to `127.0.0.1` (where k3d's load balancer listens):
+
+**Windows (run terminal as Administrator):**
+
 ```powershell
 Add-Content -Path "C:\Windows\System32\drivers\etc\hosts" -Value "127.0.0.1 todo-app.local"
 ```
 
 **macOS / Linux:**
+
 ```bash
 echo "127.0.0.1 todo-app.local" | sudo tee -a /etc/hosts
 ```
 
-After this, `http://todo-app.local/todos` works directly in your browser and HTTP client.
+#### Done — test it
+
+```bash
+curl http://todo-app.local/todos
+# []
+```
+
+Open `http://todo-app.local/todos` in your browser — you should see an empty JSON array
+(no todos yet).
 
 ---
 
@@ -219,13 +385,14 @@ Your browser / HTTP client (host machine)
         │
         ▼
 ┌─────────────────────────────────────────────────────────┐
-│  Docker Desktop port-forward (host port 80)             │  ← HOST MACHINE boundary
-│  Maps localhost:80 → ingress-nginx-controller pod:80    │
+│  k3d load balancer (host port 80)                       │  ← HOST MACHINE boundary
+│  k3d port-maps 127.0.0.1:80 → k3d-dev-serverlb:80      │
+│  then forwards → k3d-dev-server-0:80                    │
 └─────────────────────────────────────────────────────────┘
         │
         ▼  (now INSIDE the cluster)
 ┌─────────────────────────────────────────────────────────┐
-│  ingress-nginx-controller  (type: LoadBalancer)         │
+│  ingress-nginx-controller  (hostNetwork: true)          │
 │  Reads the Ingress rule: host=todo-app.local → /        │
 │  Forwards to: todo-app-service:80                       │
 │                                                         │
@@ -240,13 +407,13 @@ Your browser / HTTP client (host machine)
 
 ### Key points
 
-| Question | Answer |
-|---|---|
-| Is the **Ingress object** inside the cluster? | Yes — `Ingress` is a K8s resource that lives inside the cluster |
-| Is the **nginx Ingress Controller** inside the cluster? | Yes — it runs as a pod inside the cluster |
-| Is it accessible **from outside** the cluster? | **Yes, on Docker Desktop** — Docker Desktop intercepts `type: LoadBalancer` and port-forwards it to `localhost` on your host machine. See [Option 0](#option-0--docker-desktop--minikube-this-repo--local-dev-only) for a full explanation. |
-| Why does `todo-app-service` use `ClusterIP` and not `LoadBalancer`? | `ClusterIP` is intentional — the app Service is **internal only**. Only the Ingress controller needs to be exposed. All external traffic enters through the Ingress controller, which then forwards to the ClusterIP service. |
-| What happens on bare-metal if you use `type: LoadBalancer`? | The Service stays stuck at `EXTERNAL-IP: <pending>` forever — there is no cloud API to call. See [Production Ingress Best Practices](#production-ingress-best-practices) for solutions. |
+| Question                                                            | Answer                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Is the **Ingress object** inside the cluster?                       | Yes — `Ingress` is a K8s resource that lives inside the cluster                                                                                                                                                                                                                                                                                                                                                                                           |
+| Is the **nginx Ingress Controller** inside the cluster?             | Yes — it runs as a pod inside the cluster                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Is it accessible **from outside** the cluster?                      | **Yes, on k3d** — k3d ships a [built-in load balancer](https://github.com/k3d-io/k3d/blob/main/docs/design/project.md) (nginx-based) that forwards host ports to server nodes. When the ingress controller uses `hostNetwork: true`, it binds directly to port 80/443 on the server node, and the k3d load balancer routes host traffic there. See [k3d exposing services docs](https://github.com/k3d-io/k3d/blob/main/docs/usage/exposing_services.md). |
+| Why does `todo-app-service` use `ClusterIP` and not `LoadBalancer`? | `ClusterIP` is intentional — the app Service is **internal only**. Only the Ingress controller needs to be exposed. All external traffic enters through the Ingress controller, which then forwards to the ClusterIP service.                                                                                                                                                                                                                             |
+| What happens on bare-metal if you use `type: LoadBalancer`?         | The Service stays stuck at `EXTERNAL-IP: <pending>` forever — there is no cloud API to call. See [Production Ingress Best Practices](#production-ingress-best-practices) for solutions.                                                                                                                                                                                                                                                                   |
 
 ---
 
@@ -268,80 +435,57 @@ The solutions below address this gap, **starting with the local dev setup used i
 
 ---
 
-### Option 0 — Docker Desktop / minikube (this repo — local dev only)
+### Option 0 — k3d (this repo — local dev only)
 
-**Use when:** developing on your laptop with Docker Desktop or minikube. **Not for production.**
+**Use when:** developing on your laptop with k3d. **Not for production.**
 
-This is the approach used in this repository. The ingress-nginx-controller Service is type
-`LoadBalancer`, but there is no real cloud load balancer involved. Instead, both Docker Desktop
-and minikube ship with a built-in mechanism that intercepts `LoadBalancer` Services and maps
-them to your host machine:
+This is the approach used in this repository. k3d runs a lightweight Kubernetes cluster (k3s)
+inside Docker containers and ships a built-in load balancer (nginx-based) that sits in front
+of your server nodes.
 
-#### How Docker Desktop does it
-
-Docker Desktop runs a single-node Kubernetes cluster **inside a lightweight VM** (HyperV on
-Windows, HyperKit on macOS). It ships with its own `LoadBalancer` controller that watches for
-`type: LoadBalancer` Services and automatically configures a **port-forward from the VM into
-`localhost` on your host machine**.
+#### How it works
 
 ```
-Host machine  (Windows / macOS)
+Host machine  (Windows / macOS / Linux)
    │
    │  http://todo-app.local:80
    │  resolves to 127.0.0.1 via /etc/hosts
    │
    ▼
-localhost:80  ◄── Docker Desktop port-forward ──►  VM:80
-                                                        │
-                                          ┌─────────────┘  (inside the VM = inside the cluster)
-                                          ▼
-                              ingress-nginx-controller Service
-                              EXTERNAL-IP: localhost   ← Docker Desktop sets this
-                              type: LoadBalancer
-                                          │
-                                          ▼
-                              ingress-nginx-controller Pod
-                                          │  reads Ingress rules
-                                          ▼
-                              todo-app-service (ClusterIP)
-                                          │
-                                          ▼
-                              todo-app pods (×3)
+127.0.0.1:80       ◄── k3d port mapping ──►   k3d-dev-serverlb:80
+                                                    │  (k3d's built-in nginx load balancer)
+                                                    │  forwards to server node port 80
+                                                    ▼
+                                          k3d-dev-server-0:80
+                                                    │
+                                                    │  hostNetwork: true
+                                                    ▼
+                                          ingress-nginx-controller Pod
+                                                    │  reads Ingress rules
+                                                    ▼
+                                          todo-app-service (ClusterIP)
+                                                    │
+                                                    ▼
+                                          todo-app pods (×3)
 ```
 
-You can verify this yourself — this is the exact output from our cluster:
-```bash
-kubectl get svc ingress-nginx-controller -n ingress-nginx
-# NAME                       TYPE           CLUSTER-IP       EXTERNAL-IP   PORT(S)
-# ingress-nginx-controller   LoadBalancer   10.106.75.174    localhost     80:30525/TCP,443:30315/TCP
-#                                                            ^^^^^^^^^
-#                                           Docker Desktop sets EXTERNAL-IP = localhost automatically
-```
+Key architectural points:
 
-`EXTERNAL-IP: localhost` is the key. On a real cluster or bare-metal, this field would either
-show a public IP (cloud) or stay `<pending>` forever (bare-metal with no LB provider).
-
-#### How minikube does it (different mechanism, same result)
-
-minikube does **not** auto-map `LoadBalancer` Services. Instead you run `minikube tunnel` in a
-separate terminal, which creates a network route from your host to the minikube VM and assigns
-each `LoadBalancer` Service an IP from the VM's subnet:
-
-```bash
-minikube tunnel   # run in a separate terminal, requires sudo/admin
-# Now LoadBalancer Services get a real IP (e.g. 192.168.49.2)
-kubectl get svc ingress-nginx-controller -n ingress-nginx
-# EXTERNAL-IP: 192.168.49.2
-```
+- k3d creates an `@loadbalancer` container (`k3d-dev-serverlb`) that is an nginx reverse proxy
+- Port mappings (`-p "80:80@loadbalancer"`) tell k3d to map host port 80 to the load balancer
+- The ingress controller runs with `hostNetwork: true`, binding directly to port 80/443 on the server node
+- The k3d load balancer is configured to forward incoming traffic on port 80 to the server node's port 80
+- No `LoadBalancer` Service type is needed — the controller uses `ClusterIP` internally + `hostNetwork` for inbound
 
 #### Why this only works locally
 
-| Detail | Docker Desktop | minikube tunnel | Real cloud |
-|---|---|---|---|
-| Mechanism | Built-in port-forward from VM to host `localhost` | Network route from host to VM subnet | Cloud provider creates a real external IP |
-| `EXTERNAL-IP` value | `localhost` | VM subnet IP (e.g. `192.168.49.2`) | Real public IP / DNS |
-| Accessible from other machines on your network? | ❌ No — `localhost` only | ❌ No — VM subnet IP, not routable externally | ✅ Yes |
-| Production suitable? | ❌ No | ❌ No | ✅ Yes |
+| Detail                          | k3d                                                  | Real cloud                                         |
+| ------------------------------- | ---------------------------------------------------- | -------------------------------------------------- |
+| Mechanism                       | Built-in nginx LB container routes host → node ports | Cloud API provisions a real external load balancer |
+| Entry point                     | `localhost` (via `-p` mapping)                       | Real public IP / DNS name                          |
+| TLS cert                        | Manual (self-signed or Let's Encrypt)                | Automatic or LB-managed                            |
+| Accessible from other machines? | ❌ No — `localhost` only                             | ✅ Yes                                             |
+| Production suitable?            | ❌ No                                                | ✅ Yes                                             |
 
 This is why you need one of Options 1–4 for anything beyond your own laptop.
 
@@ -374,6 +518,7 @@ todo-app pods
 ```
 
 **Production additions on top of this:**
+
 - Attach a **TLS certificate** (cert-manager + Let's Encrypt) to the Ingress controller so
   traffic is encrypted end-to-end.
 - On AWS, annotate the Service to use an **NLB** (better for Kubernetes):
@@ -425,7 +570,7 @@ spec:
     - name: http
       port: 80
       targetPort: http
-      nodePort: 30080      # fixed port, easier to configure firewall rules
+      nodePort: 30080 # fixed port, easier to configure firewall rules
     - name: https
       port: 443
       targetPort: https
@@ -433,6 +578,7 @@ spec:
 ```
 
 Apply after installing the controller:
+
 ```bash
 kubectl patch svc ingress-nginx-controller -n ingress-nginx \
   --patch-file k8s/ingress-nginx-nodeport-patch.yaml
@@ -451,10 +597,10 @@ behaviour without a cloud provider. MetalLB is a Kubernetes-native load balancer
 
 MetalLB has two modes:
 
-| Mode | How it works | When to use |
-|---|---|---|
-| **Layer 2 (ARP)** | One node "owns" the IP and announces it via ARP. Failover is automatic. | Single subnet, homelab, simple on-prem |
-| **BGP** | All nodes advertise routes via BGP to your router/switch. True ECMP load balancing. | Data centre, multi-rack, enterprise on-prem |
+| Mode              | How it works                                                                        | When to use                                 |
+| ----------------- | ----------------------------------------------------------------------------------- | ------------------------------------------- |
+| **Layer 2 (ARP)** | One node "owns" the IP and announces it via ARP. Failover is automatic.             | Single subnet, homelab, simple on-prem      |
+| **BGP**           | All nodes advertise routes via BGP to your router/switch. True ECMP load balancing. | Data centre, multi-rack, enterprise on-prem |
 
 ```
 Internet / LAN
@@ -474,6 +620,7 @@ todo-app-service (ClusterIP) → todo-app pods
 ```
 
 **Install MetalLB:**
+
 ```bash
 kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
 
@@ -485,6 +632,7 @@ kubectl wait --namespace metallb-system \
 ```
 
 **Configure an IP pool (Layer 2 example):**
+
 ```yaml
 # k8s/metallb-config.yaml
 apiVersion: metallb.io/v1beta1
@@ -494,7 +642,7 @@ metadata:
   namespace: metallb-system
 spec:
   addresses:
-    - 192.168.1.200-192.168.1.210   # ← IPs from your LAN that are free
+    - 192.168.1.200-192.168.1.210 # ← IPs from your LAN that are free
 ---
 apiVersion: metallb.io/v1beta1
 kind: L2Advertisement
@@ -549,7 +697,7 @@ spec:
     - name: controller
       ports:
         - containerPort: 80
-          hostPort: 80       # binds to node port 80 directly
+          hostPort: 80 # binds to node port 80 directly
         - containerPort: 443
           hostPort: 443
 ```
@@ -563,8 +711,7 @@ Not suitable for shared nodes.
 
 ```
 Are you developing locally on your laptop?
-  ├─ Docker Desktop → type: LoadBalancer  (Option 0) ✅  auto-maps to localhost, zero config
-  └─ minikube       → minikube tunnel     (Option 0) ✅  run tunnel, LB gets a VM subnet IP
+  └─ k3d → hostNetwork Ingress  (Option 0) ✅  built-in LB, one-port mapping, works cross-platform
 
 Are you on a managed cloud (EKS / AKS / GKE / DO)?
   └─ YES → Use type: LoadBalancer  (Option 1) ✅  simple, automatic, production-ready
@@ -589,11 +736,13 @@ Regardless of which option you use, **always terminate TLS at the Ingress Contro
 in production. The standard approach is:
 
 1. Install [cert-manager](https://cert-manager.io):
+
    ```bash
    kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.16.0/cert-manager.yaml
    ```
 
 2. Create a `ClusterIssuer` for Let's Encrypt:
+
    ```yaml
    apiVersion: cert-manager.io/v1
    kind: ClusterIssuer
@@ -627,7 +776,7 @@ in production. The standard approach is:
      tls:
        - hosts:
            - todo-app.yourdomain.com
-         secretName: todo-app-tls       # cert-manager fills this Secret automatically
+         secretName: todo-app-tls # cert-manager fills this Secret automatically
      rules:
        - host: todo-app.yourdomain.com
          http:
@@ -680,16 +829,16 @@ reachable only from that edge layer, not from the open internet.
 
 #### Why the Ingress Controller alone is not enough
 
-| Concern | nginx Ingress Controller | Dedicated Edge Layer |
-|---|---|---|
-| **WAF / OWASP rules** | Basic (modsecurity plugin, manual config) | Built-in, managed, auto-updated |
-| **DDoS protection** | ❌ None — cluster absorbs all traffic | ✅ Absorbed at edge before cluster |
-| **TLS certificate management** | cert-manager (you manage) | Managed by cloud provider |
-| **Global CDN / caching** | ❌ None | ✅ Static assets cached globally |
-| **Geo-routing / failover** | ❌ Single region | ✅ Route to nearest healthy region |
-| **Rate limiting** | Annotation-based, per-ingress | Global, policy-driven |
-| **Bot protection** | ❌ None | ✅ Managed bot rules |
-| **IP allowlisting** | Manual annotation | Centralised policy |
+| Concern                        | nginx Ingress Controller                  | Dedicated Edge Layer               |
+| ------------------------------ | ----------------------------------------- | ---------------------------------- |
+| **WAF / OWASP rules**          | Basic (modsecurity plugin, manual config) | Built-in, managed, auto-updated    |
+| **DDoS protection**            | ❌ None — cluster absorbs all traffic     | ✅ Absorbed at edge before cluster |
+| **TLS certificate management** | cert-manager (you manage)                 | Managed by cloud provider          |
+| **Global CDN / caching**       | ❌ None                                   | ✅ Static assets cached globally   |
+| **Geo-routing / failover**     | ❌ Single region                          | ✅ Route to nearest healthy region |
+| **Rate limiting**              | Annotation-based, per-ingress             | Global, policy-driven              |
+| **Bot protection**             | ❌ None                                   | ✅ Managed bot rules               |
+| **IP allowlisting**            | Manual annotation                         | Centralised policy                 |
 
 ---
 
@@ -757,14 +906,14 @@ Use your cloud's native WAF/CDN product as the edge. The nginx Ingress Controlle
 internal and handles K8s-specific routing (path-based, header-based, canary, etc.).
 The WAF handles security and the CDN handles performance.
 
-| Cloud | Edge product | Notes |
-|---|---|---|
-| **Azure** | Azure Front Door + WAF Policy | Global CDN + WAF + DDoS in one; routes to internal AKS LB |
-| **Azure** | Application Gateway WAF v2 | Regional L7 LB + WAF; AGIC can replace nginx entirely |
-| **AWS** | CloudFront + AWS WAF + Shield | CDN + WAF + DDoS; routes to internal NLB |
-| **AWS** | AWS ALB (via AWS Load Balancer Controller) | Can replace nginx entirely for AWS-native routing |
-| **GCP** | Cloud Armor + Cloud Load Balancing | WAF + DDoS + global LB; routes to internal GKE LB |
-| **Any cloud** | Cloudflare (DNS proxy mode) | CDN + WAF + DDoS + bot protection; cloud-agnostic |
+| Cloud         | Edge product                               | Notes                                                     |
+| ------------- | ------------------------------------------ | --------------------------------------------------------- |
+| **Azure**     | Azure Front Door + WAF Policy              | Global CDN + WAF + DDoS in one; routes to internal AKS LB |
+| **Azure**     | Application Gateway WAF v2                 | Regional L7 LB + WAF; AGIC can replace nginx entirely     |
+| **AWS**       | CloudFront + AWS WAF + Shield              | CDN + WAF + DDoS; routes to internal NLB                  |
+| **AWS**       | AWS ALB (via AWS Load Balancer Controller) | Can replace nginx entirely for AWS-native routing         |
+| **GCP**       | Cloud Armor + Cloud Load Balancing         | WAF + DDoS + global LB; routes to internal GKE LB         |
+| **Any cloud** | Cloudflare (DNS proxy mode)                | CDN + WAF + DDoS + bot protection; cloud-agnostic         |
 
 ```
 Azure example:
@@ -797,11 +946,11 @@ Internet ──► CloudFront + AWS WAF + Shield Standard
 Some cloud-native ingress controllers are themselves the WAF + LB combined, eliminating the
 need for a separate edge layer while still running outside the cluster:
 
-| Controller | Cloud | What it is |
-|---|---|---|
+| Controller                                        | Cloud | What it is                                                                                                                                                               |
+| ------------------------------------------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **AGIC** (Application Gateway Ingress Controller) | Azure | Azure Application Gateway WAF v2 is the LB. An AGIC pod inside the cluster watches Ingress resources and configures the gateway via ARM. No nginx inside cluster at all. |
-| **AWS Load Balancer Controller** | AWS | Creates AWS ALB/NLB directly from Ingress/Service resources. WAF can be attached to the ALB. |
-| **GKE Gateway API** | GCP | Provisions Google Cloud Load Balancer with Cloud Armor (WAF) from Gateway resources. |
+| **AWS Load Balancer Controller**                  | AWS   | Creates AWS ALB/NLB directly from Ingress/Service resources. WAF can be attached to the ALB.                                                                             |
+| **GKE Gateway API**                               | GCP   | Provisions Google Cloud Load Balancer with Cloud Armor (WAF) from Gateway resources.                                                                                     |
 
 **AGIC architecture (Azure):**
 
@@ -862,13 +1011,13 @@ This is especially useful for bare-metal or home-lab clusters that are behind NA
 
 ### Summary: direct vs layered exposure
 
-| Approach | Public IP on Ingress? | WAF | DDoS | CDN | Use case |
-|---|---|---|---|---|---|
-| Direct (nginx + public LB) | ✅ Yes | ❌ None | ❌ None | ❌ None | Dev/staging only |
-| nginx (internal) + Cloud WAF/CDN | ❌ No | ✅ | ✅ | ✅ | ✅ Production (cloud) |
-| AGIC / AWS ALB Controller | ❌ No nginx at all | ✅ | ✅ | Partial | ✅ Production (cloud-native) |
-| nginx + Cloudflare proxy | ❌ (Cloudflare masks it) | ✅ | ✅ | ✅ | ✅ Production (any cluster) |
-| nginx + Cloudflare Tunnel | ❌ No public IP at all | ✅ | ✅ | ✅ | ✅ Production (bare-metal / NAT) |
+| Approach                         | Public IP on Ingress?    | WAF     | DDoS    | CDN     | Use case                         |
+| -------------------------------- | ------------------------ | ------- | ------- | ------- | -------------------------------- |
+| Direct (nginx + public LB)       | ✅ Yes                   | ❌ None | ❌ None | ❌ None | Dev/staging only                 |
+| nginx (internal) + Cloud WAF/CDN | ❌ No                    | ✅      | ✅      | ✅      | ✅ Production (cloud)            |
+| AGIC / AWS ALB Controller        | ❌ No nginx at all       | ✅      | ✅      | Partial | ✅ Production (cloud-native)     |
+| nginx + Cloudflare proxy         | ❌ (Cloudflare masks it) | ✅      | ✅      | ✅      | ✅ Production (any cluster)      |
+| nginx + Cloudflare Tunnel        | ❌ No public IP at all   | ✅      | ✅      | ✅      | ✅ Production (bare-metal / NAT) |
 
 > **Rule of thumb:** the Ingress Controller is an internal traffic router — it should live
 > on a private IP inside your VNet. The internet-facing endpoint should always be a managed
@@ -879,16 +1028,15 @@ This is especially useful for bare-metal or home-lab clusters that are behind NA
 
 ### Environments comparison
 
-| Environment | Option | Mechanism | `EXTERNAL-IP` | External access |
-|---|---|---|---|---|
-| **Docker Desktop** (this repo) | 0 | Built-in VM→host port-forward | `localhost` | localhost only ❌ |
-| **minikube** | 0 | `minikube tunnel` network route | VM subnet IP | localhost only ❌ |
-| **AWS EKS** | 1 | Cloud provisions NLB/ALB | Public DNS | ✅ Internet |
-| **Azure AKS** | 1 | Cloud provisions Azure LB (or AGIC) | Public IP | ✅ Internet |
-| **Google GKE** | 1 | Cloud provisions GCP LB | Public IP | ✅ Internet |
-| **Bare-metal + existing LB** | 2 | NodePort → your HAProxy/F5 forwards | Node IP + port | ✅ LAN / Internet |
-| **Bare-metal (no existing LB)** | 3 | MetalLB ARP/BGP IP announcement | LAN IP from pool | ✅ LAN / Internet |
-| **Edge / single-node** | 4 | HostNetwork binds pod to node NIC | Node IP directly | ✅ LAN / Internet |
+| Environment                     | Option | Mechanism                           | `EXTERNAL-IP`    | External access   |
+| ------------------------------- | ------ | ----------------------------------- | ---------------- | ----------------- |
+| **k3d** (this repo)             | 0      | Built-in LB container + hostNetwork | `127.0.0.1`      | localhost only ❌ |
+| **AWS EKS**                     | 1      | Cloud provisions NLB/ALB            | Public DNS       | ✅ Internet       |
+| **Azure AKS**                   | 1      | Cloud provisions Azure LB (or AGIC) | Public IP        | ✅ Internet       |
+| **Google GKE**                  | 1      | Cloud provisions GCP LB             | Public IP        | ✅ Internet       |
+| **Bare-metal + existing LB**    | 2      | NodePort → your HAProxy/F5 forwards | Node IP + port   | ✅ LAN / Internet |
+| **Bare-metal (no existing LB)** | 3      | MetalLB ARP/BGP IP announcement     | LAN IP from pool | ✅ LAN / Internet |
+| **Edge / single-node**          | 4      | HostNetwork binds pod to node NIC   | Node IP directly | ✅ LAN / Internet |
 
 ---
 
@@ -988,7 +1136,7 @@ kubectl get secret todo-app-secret -n dotnet-k8s \
 ### Ingress & nginx controller
 
 ```bash
-# Check the Ingress controller service (should show EXTERNAL-IP=localhost on Docker Desktop)
+# Check the Ingress controller service
 kubectl get svc ingress-nginx-controller -n ingress-nginx
 
 # View nginx Ingress controller logs (useful for 404/502 debugging)
@@ -1034,13 +1182,13 @@ kubectl delete -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/con
 
 ## API Endpoints
 
-| Method | Route | Body | Description |
-|--------|-------|------|-------------|
-| `GET` | `/todos` | — | List all todos |
-| `GET` | `/todos/{id}` | — | Get todo by Guid |
-| `POST` | `/todos` | `{"title": "..."}` | Create a todo |
-| `PUT` | `/todos/{id}` | `{"title": "...", "isComplete": true}` | Update a todo |
-| `DELETE` | `/todos/{id}` | — | Delete a todo |
+| Method   | Route         | Body                                   | Description      |
+| -------- | ------------- | -------------------------------------- | ---------------- |
+| `GET`    | `/todos`      | —                                      | List all todos   |
+| `GET`    | `/todos/{id}` | —                                      | Get todo by Guid |
+| `POST`   | `/todos`      | `{"title": "..."}`                     | Create a todo    |
+| `PUT`    | `/todos/{id}` | `{"title": "...", "isComplete": true}` | Update a todo    |
+| `DELETE` | `/todos/{id}` | —                                      | Delete a todo    |
 
 ---
 
@@ -1049,10 +1197,10 @@ kubectl delete -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/con
 The file `DotnetK8sSetup/todos.http` covers the full CRUD flow.
 Environments are defined in `DotnetK8sSetup/http-client.env.json`:
 
-| Environment | `baseUrl` | When to use |
-|---|---|---|
-| `local` | `http://localhost:5239` | `dotnet run` on your machine |
-| `k8s` | `http://todo-app.local` | Deployed to Docker Desktop cluster |
+| Environment | `baseUrl`               | When to use                  |
+| ----------- | ----------------------- | ---------------------------- |
+| `local`     | `http://localhost:5239` | `dotnet run` on your machine |
+| `k8s`       | `http://todo-app.local` | Deployed to k3d cluster      |
 
 In **Rider**: select the environment from the dropdown in the top-right corner of the `.http` file editor, then click the green ▶ button next to each request.
 
